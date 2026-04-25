@@ -14,6 +14,7 @@ A production-oriented FastAPI backend implementing **multi-tenancy**, **JWT auth
 - [Authentication & Authorization Flow](#authentication--authorization-flow)
 - [Permission System](#permission-system)
 - [API Endpoints](#api-endpoints)
+- [App-level routes](#app-level-routes)
 - [Environment Variables](#environment-variables)
 - [Getting Started](#getting-started)
   - [Prerequisites](#prerequisites)
@@ -28,7 +29,7 @@ A production-oriented FastAPI backend implementing **multi-tenancy**, **JWT auth
 ## Features
 
 - **Multi-tenancy** — One user can belong to many tenants; each membership is an independent row with its own role grants.
-- **JWT Authentication** — Stateless tokens issued at login; tenant context supplied per-request via `X-Tenant-ID` header.
+- **JWT Authentication** — Login returns a global access token **plus** each active tenant membership and the user’s **roles in that tenant** (so a client can pick a tenant and header without a second round-trip).
 - **Role-Based Access Control (RBAC)** — Roles carry granular permission codes. A user may hold multiple roles inside a tenant (true M2M). Permissions are global (not per-tenant).
 - **System Roles** — `admin`, `member`, `viewer` seeded once at platform level (`tenant_id IS NULL`), visible to every tenant, immutable via tenant-scoped API.
 - **Platform Super Admin** — A `is_super_admin` flag on users that bypasses all tenant membership and permission checks.
@@ -60,7 +61,7 @@ A production-oriented FastAPI backend implementing **multi-tenancy**, **JWT auth
 
 ```
 .
-├── main.py                          # App factory; mounts /api/v1 router
+├── main.py                          # FastAPI app; GET /, GET /health; mounts /api/v1
 ├── alembic.ini                      # Alembic configuration
 ├── requirements.txt                 # Python dependencies
 ├── .env                             # Local environment variables (do not commit)
@@ -273,12 +274,12 @@ A user can hold **multiple** roles inside a single tenant.
 
 ```
 POST /api/v1/auth/login
-Content-Type: application/x-www-form-urlencoded
+Content-Type: application/json
 
-username=user@example.com&password=secret
+{"email": "user@example.com", "password": "secret"}
 ```
 
-Returns a **global JWT** containing `sub` (user UUID) and `is_super_admin`. The token is not bound to any tenant.
+Returns a **`TokenResponse`**: `access_token` (global JWT), `user_id`, `is_super_admin`, `expires_in_min`, and **`tenants`** — one entry per **active** `UserTenant` row, each with `tenant_id` and `roles` (id + name for every `UserRole` in that tenant). The JWT payload includes `sub` (user UUID) and `is_super_admin`; it is not bound to a tenant.
 
 ### 2. Authenticated Request
 
@@ -293,8 +294,10 @@ X-Tenant-ID: <tenant-uuid>
 ### 3. Authorization checks (in order)
 
 1. **`get_current_user`** — decodes JWT, loads `User`, requires `is_active`.
-2. **`get_tenant_context`** — validates `X-Tenant-ID`; requires a `UserTenant` row for non-super-admins.
-3. **`require_permission("code")`** — single-JOIN query: `UserRole → Role → RolePermission → Permission`. Checks `UserTenant.is_active` (soft-removed members are blocked). Super-admins bypass.
+2. **`get_tenant_context`** — validates `X-Tenant-ID`; for non-super-admins, requires **any** `UserTenant` row for that pair (it does **not** filter on `UserTenant.is_active` — only row existence).
+3. **`require_permission("code")`** — for non-super-admins, requires **`UserTenant.is_active`** and a role grant that includes the permission code (single JOIN: `UserRole → Role → RolePermission → Permission`). Super-admins bypass.
+
+So a user with `is_active = false` on membership may still satisfy `get_tenant_context` on routes that only use that dependency; permissioned routes still block them at step 3.
 
 ### Password security
 
@@ -307,12 +310,14 @@ X-Tenant-ID: <tenant-uuid>
 
 Permissions are defined **manually** in `app/core/permissions/definitions.py` as a list of `(code, description)` tuples. They are never auto-detected from routes.
 
+The live list is in `definitions.py` (currently a dozen codes spanning users, roles, `permission.sync`, and tenant admin operations). Example:
+
 ```python
 TENANT_PERMISSIONS = [
-    ("user.create",  "Create user"),
-    ("user.list",    "List users"),
-    ("role.create",  "Create role"),
-    ...
+    ("user.create", "Create user"),
+    ("user.list",   "List users"),
+    ("role.create", "Create role"),
+    # ... see app/core/permissions/definitions.py for the full catalog
 ]
 ```
 
@@ -349,7 +354,7 @@ All routes are mounted under `/api/v1`.
 
 | Method | Path | Auth | Notes |
 |---|---|---|---|
-| `POST` | `/auth/login` | None | Returns JWT |
+| `POST` | `/auth/login` | None | JSON body: `email`, `password` — returns JWT, `tenants` with `roles` per tenant |
 
 ### Public
 
@@ -370,7 +375,7 @@ All routes are mounted under `/api/v1`.
 |---|---|---|---|
 | `POST` | `/users/create` | `user.create` | Create/attach user to tenant, grant roles |
 | `GET` | `/users/list` | `user.list` | List active members with their roles |
-| `GET` | `/users/me/roles` | — (any member) | Authenticated user's own roles in this tenant |
+| `GET` | `/users/me/roles` | — | `X-Tenant-ID` + JWT; no `require_permission` — only `get_tenant_context` (see [caveat](#known-caveats) on inactive membership) |
 | `GET` | `/users/{user_id}/roles` | `user.list` | Any user's roles in this tenant |
 | `POST` | `/users/{user_id}/roles/{role_id}` | `user.update` | Grant a role to a user (idempotent) |
 | `DELETE` | `/users/{user_id}/roles/{role_id}` | `user.update` | Revoke a role from a user |
@@ -392,9 +397,18 @@ All routes are mounted under `/api/v1`.
 
 | Method | Path | Permission | Notes |
 |---|---|---|---|
-| `GET` | `/permissions/permission-list` | — (any member) | Browse the global permission catalog |
+| `GET` | `/permissions/permission-list` | — | `X-Tenant-ID` + JWT; browse the global permission catalog (membership only, no specific permission code) |
 
-> **Interactive docs:** [http://localhost:8000/docs](http://localhost:8000/docs) (Swagger UI) and [http://localhost:8000/redoc](http://localhost:8000/redoc)
+### App-level routes
+
+Mounted on the **FastAPI `app` in `main.py`** (not under `/api/v1`).
+
+| Method | Path | Auth | Notes |
+|---|---|---|---|
+| `GET` | `/` | None | Liveness: `{"status": "ok"}` |
+| `GET` | `/health` | None | Health: `{"status": "running"}` |
+
+> **Interactive docs:** [http://localhost:8000/docs](http://localhost:8000/docs) (Swagger UI) and [http://localhost:8000/redoc](http://localhost:8000/redoc) — only `/api/v1/*` is listed there; `/` and `/health` are still served as above.
 
 ---
 
@@ -474,17 +488,19 @@ source .venv/bin/activate
 # Install dependencies
 pip install -r requirements.txt
 
-# Copy and edit environment variables
-cp .env.example .env   # then edit DATABASE_URL, JWT_SECRET_KEY, etc.
+# Create a .env file in the project root (this repo has no .env.example)
+# See [Environment variables](#environment-variables) for required keys.
 ```
 
 ### Database Setup
+
+The app loads **`DATABASE_URL`** from `.env` via Pydantic settings. **Alembic** reads **`sqlalchemy.url`** from `alembic.ini` (see `alembic/env.py` — it does not import `.env` automatically). Keep those two URLs pointed at the **same database** before running:
 
 ```bash
 alembic upgrade head
 ```
 
-> `alembic.ini` and `.env` must both point to the same `DATABASE_URL`.
+Alternatively, you can set `sqlalchemy.url` from the environment in a pre-command hook or by extending `alembic/env.py`; out of the box, edit `alembic.ini` to match `.env`.
 
 ### Bootstrap — required order
 
@@ -526,3 +542,5 @@ The API will be available at [http://localhost:8000](http://localhost:8000).
 | **Mail settings required** | `app/core/config/settings.py` | All `MAIL_*` variables must be present in `.env` even though no mailer is wired to any endpoint. Make them `Optional[str] = None` to relax this requirement. |
 | **No CORS / rate limiting** | `main.py`, `app/routers/public/tenants.py` | Add `CORSMiddleware` for SPA clients and rate-limit the public registration endpoint before exposing publicly. |
 | **Tenant-admin `is_active` default** | `app/models/user.py` | `User.is_active` defaults to `False` at the model level, but the CLI scripts and services set it to `True` explicitly when creating seeded/registered users. New users created via `POST /users/create` inherit the `True` override in `UserService`. |
+| **`get_tenant_context` vs soft membership** | `app/dependencies/auth.py` | A user with `UserTenant.is_active = false` may still get past `get_tenant_context` if a row exists. Permission checks (`require_permission`) and listing flows that use active membership still enforce the flag where implemented. |
+| **Login vs OpenAPI `tokenUrl`** | `app/dependencies/auth.py` | `OAuth2PasswordBearer(tokenUrl=...)` is used for the interactive **Authorize** button in Swagger; the real `/auth/login` handler expects a **JSON** `LoginRequest`, not a form body. |
