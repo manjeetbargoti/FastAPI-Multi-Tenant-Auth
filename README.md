@@ -1,6 +1,6 @@
 # FastAPI Multi-Tenant Auth
 
-A production-oriented FastAPI backend implementing **multi-tenancy**, **JWT authentication**, and **role-based access control (RBAC)**. Each tenant has its own isolated set of roles and permissions, with a global platform super-admin that can manage all tenants.
+A production-oriented FastAPI backend implementing **multi-tenancy**, **JWT authentication**, and **role-based access control (RBAC)**. Users can belong to multiple tenants simultaneously, each membership carrying its own set of roles. Permissions are global and shared across the platform; roles are either system-wide (seeded once) or tenant-owned (created per tenant).
 
 ---
 
@@ -12,29 +12,30 @@ A production-oriented FastAPI backend implementing **multi-tenancy**, **JWT auth
 - [Architecture Overview](#architecture-overview)
 - [Database Models](#database-models)
 - [Authentication & Authorization Flow](#authentication--authorization-flow)
+- [Permission System](#permission-system)
 - [API Endpoints](#api-endpoints)
 - [Environment Variables](#environment-variables)
 - [Getting Started](#getting-started)
   - [Prerequisites](#prerequisites)
   - [Installation](#installation)
   - [Database Setup](#database-setup)
-  - [Bootstrap (Optional)](#bootstrap-optional)
+  - [Bootstrap — required order](#bootstrap--required-order)
   - [Running the Server](#running-the-server)
-- [Permission System](#permission-system)
 - [Known Caveats](#known-caveats)
 
 ---
 
 ## Features
 
-- **Multi-tenancy** — Users belong to multiple tenants simultaneously; each membership carries its own role.
-- **JWT Authentication** — Stateless tokens issued at login; tenant context selected per-request via header.
-- **Role-Based Access Control (RBAC)** — Per-tenant roles with granular permission codes; permissions are auto-synced from a canonical catalog.
-- **Platform Super Admin** — A global super-admin flag on users that bypasses tenant membership and permission checks.
-- **Public Tenant Self-Registration** — Unauthenticated endpoint for creating a new tenant and an initial admin user.
-- **Layered Architecture** — Clean separation: router → service → repository → SQLAlchemy ORM.
-- **Alembic Migrations** — Full migration history with autogenerate support.
-- **CLI Bootstrap Scripts** — One-command seeding for platform admin and default tenant.
+- **Multi-tenancy** — One user can belong to many tenants; each membership is an independent row with its own role grants.
+- **JWT Authentication** — Stateless tokens issued at login; tenant context supplied per-request via `X-Tenant-ID` header.
+- **Role-Based Access Control (RBAC)** — Roles carry granular permission codes. A user may hold multiple roles inside a tenant (true M2M). Permissions are global (not per-tenant).
+- **System Roles** — `admin`, `member`, `viewer` seeded once at platform level (`tenant_id IS NULL`), visible to every tenant, immutable via tenant-scoped API.
+- **Platform Super Admin** — A `is_super_admin` flag on users that bypasses all tenant membership and permission checks.
+- **Public Tenant Self-Registration** — Unauthenticated endpoint for creating a new tenant and an initial owner user.
+- **Layered Architecture** — Router → Service → Repository → SQLAlchemy ORM.
+- **Alembic Migrations** — Single clean init migration; autogenerate-ready.
+- **CLI Bootstrap Scripts** — Three idempotent scripts that must run in order after a fresh migration.
 
 ---
 
@@ -68,7 +69,7 @@ A production-oriented FastAPI backend implementing **multi-tenancy**, **JWT auth
 │   ├── env.py                       # Migration runtime; imports ORM metadata
 │   ├── script.py.mako               # Migration file template
 │   └── versions/
-│       └── 456d7a345c4b_init_multi_tenant_rbac.py  # Initial RBAC schema migration
+│       └── 531cc8a977ae_init_multi_tenant_rbac.py  # Clean init migration
 │
 └── app/
     ├── core/
@@ -78,57 +79,64 @@ A production-oriented FastAPI backend implementing **multi-tenancy**, **JWT auth
     │   ├── security/
     │   │   └── security.py          # Argon2 hashing, JWT create/decode
     │   └── permissions/
-    │       └── definitions.py       # Canonical TENANT_PERMISSIONS catalog
+    │       ├── definitions.py       # TENANT_PERMISSIONS catalog — source of truth
+    │       └── system_roles.py      # SYSTEM_ROLES declarative catalog
     │
     ├── dependencies/
     │   ├── auth.py                  # get_current_user, get_tenant_context (X-Tenant-ID)
     │   └── permissions.py           # require_permission(code) dependency factory
     │
     ├── models/
-    │   ├── user.py                  # User, UserTenant
+    │   ├── base.py                  # Declarative base (re-export from database.py)
+    │   ├── mixinx.py                # TimestampMixin (created_at, updated_at, deleted_at)
     │   ├── tenant.py                # Tenant
-    │   ├── role.py                  # Role, RolePermission
-    │   ├── permission.py            # Permission
-    │   └── mixinx.py               # TimestampMixin (created_at, updated_at, deleted_at)
+    │   ├── user.py                  # User
+    │   ├── permission.py            # Permission (global, no tenant_id)
+    │   ├── role.py                  # Role (tenant_id nullable → system roles)
+    │   ├── role_permission.py       # RolePermission (M2M join table)
+    │   ├── user_role.py             # UserRole (M2M, surrogate PK, tenant_id, granted_by)
+    │   └── user_tenant.py           # UserTenant (membership: invited_by, joined_at, is_active)
     │
     ├── schemas/
-    │   ├── auth.py                  # LoginRequest, TokenResponse
-    │   ├── user.py                  # UserCreate, UserOutput, UserListItem
-    │   ├── tenant.py                # Tenant create/register DTOs
-    │   ├── role.py                  # RoleCreate, RoleOutPut, RoleInfo
+    │   ├── auth.py                  # LoginRequest, TokenResponse, TenantRegistration*
+    │   ├── user.py                  # UserCreate, UserOutput, UserListItem, UserRoleInfo
+    │   ├── tenant.py                # PlatformTenantCreate
+    │   ├── role.py                  # RoleCreate, RoleOutPut, RoleDetail, RoleInfo, RolePermissionUpdate
     │   └── permission.py            # PermissionOutput
     │
     ├── repositories/
-    │   ├── base.py                  # BaseRepository (holds Session)
-    │   ├── user_repo.py             # UserRepo (with joinedload for memberships)
+    │   ├── base_repo.py             # BaseRepository (holds Session)
+    │   ├── user_repo.py             # UserRepo
+    │   ├── user_tenant_repo.py      # UserTenantRepo
+    │   ├── user_role_repo.py        # UserRoleRepo
     │   ├── tenant_repo.py           # TenantRepo
-    │   ├── role_repo.py             # RoleRepo
+    │   ├── role_repo.py             # RoleRepo (get_system_role, get_by_id_in_tenant)
     │   └── permission_repo.py       # PermissionRepo
     │
     ├── services/
     │   ├── auth_service.py          # Login, token validation
-    │   ├── user_service.py          # User creation, listing
-    │   ├── tenant_service.py        # Tenant creation, permission sync
-    │   ├── role_service.py          # Role CRUD, role assignment
-    │   └── permission_service.py    # sync_permissions_for_tenant
+    │   ├── user_service.py          # User creation, listing, role assignment/revocation
+    │   ├── tenant_service.py        # Tenant provisioning (public + platform-admin paths)
+    │   ├── role_service.py          # Role CRUD, permission-set management
+    │   └── permission_service.py    # sync_permissions_global, list_permissions
     │
     ├── routers/
     │   ├── routes_v1.py             # Aggregates all v1 routers
     │   ├── admin/
     │   │   ├── auth.py              # POST /auth/login
-    │   │   ├── users.py             # POST /users/create, GET /users/list
-    │   │   ├── roles.py             # POST /roles/create
+    │   │   ├── users.py             # User CRUD + role assignment endpoints
     │   │   ├── tenants.py           # POST /platform/tenant/create (super admin)
-    │   │   └── permissions.py       # POST /platform/permissions/sync (not wired)
+    │   │   └── permissions.py       # POST /platform/permissions/sync (super admin)
     │   ├── tenant/
-    │   │   ├── roles.py             # POST /roles/create, GET /roles/list
+    │   │   ├── roles.py             # Role CRUD + permission-set management
     │   │   └── permissions.py       # GET /permissions/permission-list
     │   └── public/
     │       └── tenants.py           # POST /public/tenant/register (no auth)
     │
     ├── cli/
-    │   ├── platform_user.py         # Create platform super-admin
-    │   └── tenant_seed.py           # Seed default tenant + admin
+    │   ├── system_seed.py           # Step 1 — global permissions + system roles
+    │   ├── platform_user.py         # Step 2 — platform super-admin user
+    │   └── tenant_seed.py           # Step 3 — default tenant + tenant-admin user
     │
     └── utils/
         └── permission_marker.py     # @permission(code) decorator stub
@@ -138,7 +146,7 @@ A production-oriented FastAPI backend implementing **multi-tenancy**, **JWT auth
 
 ## Architecture Overview
 
-The application follows a strict **four-layer architecture**:
+### Four-layer stack
 
 ```
 HTTP Request
@@ -156,94 +164,126 @@ Repository (data access)
 SQLAlchemy ORM / PostgreSQL
 ```
 
-**Key dependency chain for protected endpoints:**
+### Request dependency chain for protected endpoints
 
 ```
-Depends(get_current_user)           ← decodes JWT, loads User
-Depends(get_tenant_context)         ← reads X-Tenant-ID header, validates membership
-Depends(require_permission("code")) ← checks role.permissions for the tenant
+Depends(get_current_user)            ← decodes JWT, loads User, checks is_active
+Depends(get_tenant_context)          ← reads X-Tenant-ID header; super-admins bypass
+Depends(require_permission("code"))  ← single JOIN: UserRole→Role→RolePermission→Permission
 ```
+
+Super-admins short-circuit every check and are always allowed.
 
 ---
 
 ## Database Models
 
-### `users`
-Global user identity. One user can be a member of many tenants.
-
-| Column | Type | Notes |
-|---|---|---|
-| `id` | UUID PK | |
-| `email` | String | Unique |
-| `password` | String | Argon2 hash |
-| `is_active` | Boolean | Default `True` |
-| `is_verified` | Boolean | Default `False` |
-| `is_super_admin` | Boolean | Default `False`; bypasses all tenant checks |
-| `verified_at` | DateTime | Nullable |
-| `created_at`, `updated_at`, `deleted_at` | DateTime | Via `TimestampMixin` |
-
 ### `tenants`
 
 | Column | Type | Notes |
 |---|---|---|
-| `id` | UUID PK | |
-| `name` | String | Unique |
-| `is_active` | Boolean | Default `True` |
-| `created_at`, `updated_at` | DateTime | |
+| `id` | UUID PK | uuid7 |
+| `name` | String(150) | Unique, indexed |
+| `is_active` | Boolean | Default `True`, indexed |
+| `created_at`, `updated_at`, `deleted_at` | DateTime(tz) | Via `TimestampMixin` |
 
-### `user_tenants` (membership)
-
-Links a user to a tenant with an optional role. The **primary RBAC join** used by the app.
+### `users`
 
 | Column | Type | Notes |
 |---|---|---|
-| `id` | UUID PK | |
-| `user_id` | UUID FK → `users` | |
-| `tenant_id` | UUID FK → `tenants` | |
-| `role_id` | UUID FK → `roles` | Nullable; one role per membership |
-| Unique | `(user_id, tenant_id)` | |
+| `id` | UUID PK | uuid7 |
+| `first_name`, `last_name` | String(255) | Nullable |
+| `email` | String(255) | Unique, indexed |
+| `password` | String(255) | Argon2 hash |
+| `is_active` | Boolean | Default `False`, indexed |
+| `is_verified` | Boolean | Default `False`, indexed |
+| `is_super_admin` | Boolean | Default `False`, indexed |
+| `verified_at` | DateTime(tz) | Nullable |
+| `created_at`, `updated_at`, `deleted_at` | DateTime(tz) | |
+
+### `permissions` — GLOBAL (no tenant scope)
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | uuid7 |
+| `code` | String(150) | Globally unique, indexed (e.g. `user.create`) |
+| `description` | String(255) | Nullable |
+| `category` | String(50) | Nullable, indexed — auto-derived from the first dot segment of `code` |
+| `scope` | String(20) | Default `"tenant"` |
+| `created_at`, `updated_at`, `deleted_at` | DateTime(tz) | |
+
+Permissions are **not** scoped to a tenant. One row per code, shared by all.
 
 ### `roles`
 
-Per-tenant roles with a many-to-many relationship to permissions.
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | uuid7 |
+| `tenant_id` | UUID FK → `tenants` | **Nullable** — `NULL` = system role |
+| `name` | String(100) | |
+| `description` | String(255) | Nullable |
+| `is_system` | Boolean | Default `False`; system roles cannot be modified via tenant API |
+| `scope` | String(20) | Default `"tenant"` |
+| `created_at`, `updated_at`, `deleted_at` | DateTime(tz) | |
+
+**Unique constraints:**
+- `(tenant_id, name)` — name unique within a tenant (`uq_role_tenant_name`)
+- Partial unique index `uq_role_system_name` on `name WHERE tenant_id IS NULL` — enforces globally unique names for system roles
+
+### `role_permissions` — M2M join
 
 | Column | Type | Notes |
 |---|---|---|
-| `id` | UUID PK | |
-| `name` | String | Unique per tenant |
-| `tenant_id` | UUID FK → `tenants` | |
-| `scope` | String | Default `"tenant"` |
+| `role_id` | UUID FK → `roles` CASCADE | Composite PK |
+| `permission_id` | UUID FK → `permissions` CASCADE | Composite PK |
 
-### `permissions`
+### `user_tenants` — membership
 
-Per-tenant permission codes synced from the canonical catalog.
+Links a user to a tenant. Role grants live in `user_roles`, NOT here.
 
 | Column | Type | Notes |
 |---|---|---|
-| `id` | UUID PK | |
-| `code` | String | Unique per tenant (e.g. `user.create`) |
-| `description` | String | Human-readable label |
-| `tenant_id` | UUID FK → `tenants` | |
-| `scope` | String | |
+| `id` | UUID PK | uuid7 |
+| `user_id` | UUID FK → `users` CASCADE | Indexed |
+| `tenant_id` | UUID FK → `tenants` CASCADE | Indexed |
+| `invited_by` | UUID FK → `users` SET NULL | Nullable, indexed |
+| `joined_at` | DateTime(tz) | Default `utcnow` |
+| `is_active` | Boolean | Default `True`, indexed — soft-removal flag |
+| Unique | `(user_id, tenant_id)` | `uq_user_tenant` |
 
-### `role_permissions`
-Association table between `roles` and `permissions`.
+### `user_roles` — role assignments (M2M)
+
+A user can hold **multiple** roles inside a single tenant.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | uuid7 — surrogate key |
+| `user_id` | UUID FK → `users` CASCADE | Indexed |
+| `tenant_id` | UUID FK → `tenants` CASCADE | Indexed |
+| `role_id` | UUID FK → `roles` CASCADE | Indexed |
+| `granted_by` | UUID FK → `users` SET NULL | Nullable, indexed |
+| `created_at`, `updated_at`, `deleted_at` | DateTime(tz) | |
+| Unique | `(user_id, tenant_id, role_id)` | `uq_user_tenant_role` |
 
 ---
 
 ## Authentication & Authorization Flow
 
 ### 1. Login
+
 ```
 POST /api/v1/auth/login
 Content-Type: application/x-www-form-urlencoded
 
 username=user@example.com&password=secret
 ```
-Returns a **global JWT** containing `sub` (user UUID) and `is_super_admin`. The token is **not** bound to a specific tenant.
+
+Returns a **global JWT** containing `sub` (user UUID) and `is_super_admin`. The token is not bound to any tenant.
 
 ### 2. Authenticated Request
-Send the token and the desired tenant for every protected request:
+
+Send the token and desired tenant for every protected request:
+
 ```
 GET /api/v1/users/list
 Authorization: Bearer <token>
@@ -251,13 +291,53 @@ X-Tenant-ID: <tenant-uuid>
 ```
 
 ### 3. Authorization checks (in order)
-1. **`get_current_user`** — decodes JWT, loads `User` from DB, checks `is_active`.
+
+1. **`get_current_user`** — decodes JWT, loads `User`, requires `is_active`.
 2. **`get_tenant_context`** — validates `X-Tenant-ID`; requires a `UserTenant` row for non-super-admins.
-3. **`require_permission("code")`** — checks that the user's role for that tenant includes the required permission code. Super admins are always allowed.
+3. **`require_permission("code")`** — single-JOIN query: `UserRole → Role → RolePermission → Permission`. Checks `UserTenant.is_active` (soft-removed members are blocked). Super-admins bypass.
 
 ### Password security
+
 - Argon2 hashing via `passlib`.
 - Passwords are capped at 72 UTF-8 bytes before hashing.
+
+---
+
+## Permission System
+
+Permissions are defined **manually** in `app/core/permissions/definitions.py` as a list of `(code, description)` tuples. They are never auto-detected from routes.
+
+```python
+TENANT_PERMISSIONS = [
+    ("user.create",  "Create user"),
+    ("user.list",    "List users"),
+    ("role.create",  "Create role"),
+    ...
+]
+```
+
+The `category` field is auto-derived at insert time from the first dot-segment of `code` (e.g. `user.create` → category `user`).
+
+### System roles
+
+Defined in `app/core/permissions/system_roles.py`:
+
+| Role | Permissions |
+|---|---|
+| `admin` | All codes in `TENANT_PERMISSIONS` |
+| `viewer` | `tenant.read`, `user.list`, `role.list` |
+| `member` | `tenant.read` |
+
+System roles have `tenant_id IS NULL` and `is_system = True`. They are seeded once and shared by every tenant. Tenant-scoped role endpoints block modifications to system roles (403).
+
+### Adding a new permission — checklist
+
+1. Add `("new.code", "Description")` to `definitions.py`.
+2. Optionally add `"new.code"` to the relevant role in `system_roles.py`.
+3. Re-run `python app/cli/system_seed.py` — idempotent, inserts new rows and reconciles system-role permission sets.
+4. Wire the guard in the router: `dependencies=[Depends(require_permission("new.code"))]`.
+
+Alternatively, hit `POST /api/v1/platform/permissions/sync` as a super-admin to do step 3 via HTTP.
 
 ---
 
@@ -265,32 +345,68 @@ X-Tenant-ID: <tenant-uuid>
 
 All routes are mounted under `/api/v1`.
 
+### Auth
+
 | Method | Path | Auth | Notes |
 |---|---|---|---|
-| `GET` | `/` | None | Root health check |
-| `GET` | `/health` | None | Health check |
-| `POST` | `/auth/login` | None | Returns JWT token |
-| `POST` | `/public/tenant/register` | None | Self-service tenant + admin creation |
-| `POST` | `/platform/tenant/create` | Super admin | Create tenant (admin only) |
-| `POST` | `/users/create` | JWT + Tenant + `user.create` | Create user in tenant |
-| `GET` | `/users/list` | JWT + Tenant + `user.list` | List users in tenant |
-| `POST` | `/roles/create` | JWT + Tenant | Create role in tenant |
-| `GET` | `/roles/list` | JWT + Tenant | List roles in tenant |
-| `GET` | `/permissions/permission-list` | JWT + Tenant | List permissions in tenant |
+| `POST` | `/auth/login` | None | Returns JWT |
 
-> **Interactive docs:** [http://localhost:8000/docs](http://localhost:8000/docs) (Swagger UI) and [http://localhost:8000/redoc](http://localhost:8000/redoc).
+### Public
+
+| Method | Path | Auth | Notes |
+|---|---|---|---|
+| `POST` | `/public/tenant/register` | None | Self-service tenant + owner creation |
+
+### Platform Admin (super-admin only)
+
+| Method | Path | Auth | Notes |
+|---|---|---|---|
+| `POST` | `/platform/tenant/create` | JWT + `is_super_admin` | Create tenant + initial admin user |
+| `POST` | `/platform/permissions/sync` | JWT + `is_super_admin` | Sync global permission catalog to DB |
+
+### Users (tenant-scoped, require `X-Tenant-ID`)
+
+| Method | Path | Permission | Notes |
+|---|---|---|---|
+| `POST` | `/users/create` | `user.create` | Create/attach user to tenant, grant roles |
+| `GET` | `/users/list` | `user.list` | List active members with their roles |
+| `GET` | `/users/me/roles` | — (any member) | Authenticated user's own roles in this tenant |
+| `GET` | `/users/{user_id}/roles` | `user.list` | Any user's roles in this tenant |
+| `POST` | `/users/{user_id}/roles/{role_id}` | `user.update` | Grant a role to a user (idempotent) |
+| `DELETE` | `/users/{user_id}/roles/{role_id}` | `user.update` | Revoke a role from a user |
+
+### Roles (tenant-scoped)
+
+| Method | Path | Permission | Notes |
+|---|---|---|---|
+| `POST` | `/roles/create` | `role.create` | Create tenant-owned role, optionally assign permissions |
+| `GET` | `/roles/list` | `role.list` | List all roles visible to this tenant (owned + system) |
+| `GET` | `/roles/{role_id}` | `role.list` | Role detail with full permission list |
+| `PUT` | `/roles/{role_id}/permissions` | `role.update` | Replace a role's entire permission set |
+| `POST` | `/roles/{role_id}/permissions/{permission_id}` | `role.update` | Idempotently add one permission |
+| `DELETE` | `/roles/{role_id}/permissions/{permission_id}` | `role.update` | Remove one permission |
+
+> Permission-set management is blocked on system roles (returns 403).
+
+### Permissions (tenant-scoped)
+
+| Method | Path | Permission | Notes |
+|---|---|---|---|
+| `GET` | `/permissions/permission-list` | — (any member) | Browse the global permission catalog |
+
+> **Interactive docs:** [http://localhost:8000/docs](http://localhost:8000/docs) (Swagger UI) and [http://localhost:8000/redoc](http://localhost:8000/redoc)
 
 ---
 
 ## Environment Variables
 
-Create a `.env` file in the project root. All keys are **case-sensitive**.
+Create a `.env` file in the project root.
 
 ```env
 # Application
-APP_NAME=FastAPI Multi-Tenant Auth
-DEBUG=True
-FRONTEND_URL=http://localhost:3000
+APP_NAME="FastAPI Multi Tenant Auth"
+DEBUG=False
+FRONTEND_URL=http://localhost:8000
 
 # Database
 DATABASE_URL=postgresql://user:password@localhost:5432/dbname
@@ -298,8 +414,8 @@ DATABASE_URL=postgresql://user:password@localhost:5432/dbname
 # JWT
 JWT_SECRET_KEY=your-very-secret-key-change-in-production
 JWT_ALGORITHM=HS256
-ACCESS_TOKEN_EXPIRE_MINUTES=30
-EMAIL_TOKEN_EXPIRE_MINUTES=1440
+ACCESS_TOKEN_EXPIRE_MINUTES=60
+EMAIL_TOKEN_EXPIRE_MINUTES=60
 
 # Mail (required by Settings even if not actively used)
 MAIL_USERNAME=
@@ -311,6 +427,21 @@ MAIL_STARTTLS=True
 MAIL_SSL_TLS=False
 USE_CREDENTIALS=True
 VALIDATE_CERTS=True
+```
+
+### CLI bootstrap variables (optional)
+
+Read by the CLI scripts in `app/cli/`. If a `*_PASSWORD` variable is absent, the script prompts securely via `getpass`. Minimum password length is **8 characters**.
+
+```env
+# Step 2 — platform super-admin (app/cli/platform_user.py)
+PLATFORM_ADMIN_EMAIL=admin@platform.com
+PLATFORM_ADMIN_PASSWORD=
+
+# Step 3 — default tenant + admin (app/cli/tenant_seed.py)
+SEED_TENANT_NAME=default
+SEED_TENANT_ADMIN_EMAIL=admin@tenant.com
+SEED_TENANT_ADMIN_PASSWORD=
 ```
 
 ---
@@ -331,41 +462,51 @@ git clone <repository-url>
 cd fast-api-multi-tenant-auth
 
 # Create and activate a virtual environment
-python -m venv .venv
 
 # Windows (PowerShell)
+python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
 # macOS / Linux
+python -m venv .venv
 source .venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
 
 # Copy and edit environment variables
-cp .env.example .env   # or create .env manually (see section above)
+cp .env.example .env   # then edit DATABASE_URL, JWT_SECRET_KEY, etc.
 ```
 
 ### Database Setup
 
 ```bash
-# Apply all migrations
 alembic upgrade head
 ```
 
-> Make sure `DATABASE_URL` in `.env` and `sqlalchemy.url` in `alembic.ini` point to the same database, or export `DATABASE_URL` before running Alembic.
+> `alembic.ini` and `.env` must both point to the same `DATABASE_URL`.
 
-### Bootstrap (Optional)
+### Bootstrap — required order
 
-These scripts create initial users with hardcoded credentials. **Change credentials before use in any shared environment.**
+These three scripts are **idempotent** (safe to re-run) and must be executed **in order** after a fresh migration.
 
 ```bash
-# Create a platform super-admin (admin@platform.com)
-python app/cli/platform_user.py
+# Step 1 — insert global permission catalog + create system roles (admin / member / viewer)
+python app/cli/system_seed.py
 
-# Seed a default tenant and a tenant admin (admin@tenant.com)
-python app/cli/tenant_seed.py
+# Step 2 — create the platform super-admin user
+# Supply password via env var or let the script prompt:
+PLATFORM_ADMIN_PASSWORD='your-secure-password' python app/cli/platform_user.py
+
+# Step 3 — create the default tenant + tenant-admin user, grant the system admin role
+SEED_TENANT_ADMIN_PASSWORD='your-secure-password' python app/cli/tenant_seed.py
 ```
+
+**Why order matters:**
+
+- `system_seed.py` must run first — it creates the global `admin` system role.
+- `tenant_seed.py` requires the system `admin` role to exist and will exit cleanly if it is missing.
+- `platform_user.py` is independent of the other two but makes sense after the schema is ready.
 
 ### Running the Server
 
@@ -377,38 +518,11 @@ The API will be available at [http://localhost:8000](http://localhost:8000).
 
 ---
 
-## Permission System
-
-Permissions are defined in `app/core/permissions/definitions.py` as a list of `(code, description)` tuples (e.g. `user.create`, `user.list`, `role.create`).
-
-When a new tenant is created (via either public registration or admin endpoint), `PermissionService.sync_permissions_for_tenant` automatically:
-
-1. Creates any missing `Permission` rows for that tenant from the catalog.
-2. Ensures the built-in **`admin`** role for that tenant has all permissions assigned.
-
-This means adding a new permission to `definitions.py` and re-running the sync will propagate it to all tenants without manual DB edits.
-
-To check a permission in a route:
-
-```python
-from app.dependencies.permissions import require_permission
-
-@router.get("/my-resource")
-def list_resources(
-    _: None = Depends(require_permission("resource.list")),
-    db: Session = Depends(get_db),
-):
-    ...
-```
-
----
-
 ## Known Caveats
 
 | Issue | Location | Detail |
 |---|---|---|
-| **Unreachable sync endpoint** | `app/routers/admin/permissions.py` | `perm_router` is defined but not included in `routes_v1.py`; the `/platform/permissions/sync` route cannot be reached via HTTP. |
-| **Duplicate route prefixes** | `app/routers/admin/roles.py` vs `app/routers/tenant/roles.py` | Both use `/roles/create`; consolidate prefixes to avoid conflicts in OpenAPI and routing. |
-| **`UserRole` table unused** | `app/models/`, migrations | The `user_roles` association table exists in the schema but the application resolves roles through `UserTenant.role_id`, not `UserRole`. |
-| **`list_users_in_tenant` indentation bug** | `app/services/user_service.py` | The result-building loop may only retain the last user due to a mis-indented `result` assignment; verify and fix before relying on list endpoints in production. |
-| **Mail settings required** | `app/core/config/settings.py` | All `MAIL_*` variables must be present in `.env` even though `fastapi_mail` is not currently wired into any router or service. Make them optional (`Optional[str] = None`) to remove this requirement. |
+| **Broad `except Exception` in some routers** | `app/routers/**/*.py` | Several handlers catch `Exception` and re-raise as 500. This can swallow descriptive `HTTPException` messages raised by services. Narrow to `except HTTPException: raise` first. |
+| **Mail settings required** | `app/core/config/settings.py` | All `MAIL_*` variables must be present in `.env` even though no mailer is wired to any endpoint. Make them `Optional[str] = None` to relax this requirement. |
+| **No CORS / rate limiting** | `main.py`, `app/routers/public/tenants.py` | Add `CORSMiddleware` for SPA clients and rate-limit the public registration endpoint before exposing publicly. |
+| **Tenant-admin `is_active` default** | `app/models/user.py` | `User.is_active` defaults to `False` at the model level, but the CLI scripts and services set it to `True` explicitly when creating seeded/registered users. New users created via `POST /users/create` inherit the `True` override in `UserService`. |

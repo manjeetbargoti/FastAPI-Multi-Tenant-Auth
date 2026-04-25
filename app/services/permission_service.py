@@ -1,47 +1,47 @@
-from uuid import UUID
 from sqlalchemy.orm import Session
 
 from app.repositories.permission_repo import PermissionRepo
-from app.repositories.role_repo import RoleRepo
-from app.models.tenant import Tenant
+from app.models.permission import Permission
 from app.core.permissions.definitions import TENANT_PERMISSIONS
 
 
 class PermissionService:
+    """
+    Permissions are GLOBAL across the platform — there is exactly one row per
+    `code` and that row is shared by every tenant. Sync is a platform-level
+    operation, NOT a per-tenant one.
+    """
+
     def __init__(self, db: Session):
         self.db = db
         self.permission_repo = PermissionRepo(db)
-        self.role_repo = RoleRepo(db)
 
-    def sync_permissions_for_tenant(self, tenant_id: UUID) -> None:
-        # 1️. Ensure admin role exists
-        admin_role = self.role_repo.get_by_name(name="admin", tenant_id=tenant_id)
-        if not admin_role:
-            admin_role = self.role_repo.create(tenant_id=tenant_id, name="admin")
+    def sync_permissions_global(self) -> int:
+        """
+        Idempotently insert any permission listed in TENANT_PERMISSIONS that
+        does not yet exist. Returns the number of NEW rows created (existing
+        rows are left untouched, including their `description`/`category`).
 
-        # 2️. Fetch existing permissions
-        existing_permissions = {
-            p.code: p for p in self.permission_repo.list_by_tenant(tenant_id)
-        }
+        Caller is responsible for committing the surrounding transaction.
+        """
+        existing = {p.code: p for p in self.permission_repo.list_all()}
+        created_count = 0
 
-        # 3️. Create missing permissions
         for code, description in TENANT_PERMISSIONS:
-            if code not in existing_permissions:
-                permission = self.permission_repo.create(
-                    tenant_id=tenant_id,
-                    code=code,
-                    description=description,
-                )
-                existing_permissions[code] = permission
+            if code in existing:
+                continue
 
-        # 4️. Ensure admin role has ALL permissions
-        for permission in existing_permissions.values():
-            if permission not in admin_role.permissions:
-                admin_role.permissions.append(permission)
+            category = code.split(".", 1)[0] if "." in code else None
+            self.permission_repo.create(
+                code=code,
+                description=description,
+                category=category,
+                scope="tenant",
+            )
+            created_count += 1
 
+        return created_count
 
-    def permission_list_by_tenant(self, tenant_id: UUID) -> list[Tenant]:
-        permissions = self.permission_repo.list_by_tenant(tenant_id=tenant_id)
-
-        return permissions
-    
+    def list_permissions(self) -> list[Permission]:
+        """All permissions defined on the platform, ordered by code."""
+        return self.permission_repo.list_all()

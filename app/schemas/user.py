@@ -1,12 +1,18 @@
-from pydantic import BaseModel, EmailStr
+from typing import List
 from uuid import UUID
+
+from pydantic import BaseModel, EmailStr
+
 
 class UserCreate(BaseModel):
     first_name: str | None = None
     last_name: str | None = None
     email: EmailStr
     password: str
-    role_id: UUID | None = None
+    # Multiple roles per (user, tenant) are allowed; an empty list means
+    # "membership only, no roles" (caller can grant later).
+    role_ids: List[UUID] = []
+
 
 class UserOutput(BaseModel):
     id: UUID
@@ -15,13 +21,18 @@ class UserOutput(BaseModel):
     email: EmailStr
     is_active: bool
     is_verified: bool
-    
-    class Config: 
+
+    class Config:
         from_attributes = True
 
+
 class UserRoleInfo(BaseModel):
-    id: UUID | None
-    name: str | None
+    id: UUID
+    name: str
+
+    class Config:
+        from_attributes = True
+
 
 class UserListItem(BaseModel):
     id: UUID
@@ -30,6 +41,4 @@ class UserListItem(BaseModel):
     email: EmailStr
     is_active: bool
     is_verified: bool
-    role: UserRoleInfo
-
-        
+    roles: List[UserRoleInfo] = []
